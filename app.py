@@ -61,7 +61,7 @@ def process_job(user_id: str, job_id: str, source_key: str):
 
         # 2) Pitch -2 semitones
         if ffmpeg_has_rubberband():
-            # rubberband expects a ratio, not semitones. Keep duration with tempo=1.
+            # rubberband expects ratio; keep duration with tempo=1
             semitones = -2.0
             ratio = 2 ** (semitones / 12.0)  # ≈ 0.890898718
             af = f"rubberband=pitch={ratio}:tempo=1"
@@ -72,7 +72,7 @@ def process_job(user_id: str, job_id: str, source_key: str):
             af = f"asetrate=48000/{pitch_factor},aresample=48000,atempo={pitch_factor}"
             run(["ffmpeg", "-y", "-i", str(t110), "-vn", "-af", af, "-acodec", "libmp3lame", "-b:a", "192k", str(pitch)])
 
-        # 3) Demucs (CPU) -> vocals / no_vocals
+        # 3) Demucs (CPU) -> vocals / no_vocals (faster model + CPU-friendly settings)
         demucs_out = tmp / "demucs_out"
         if demucs_out.exists():
             for p in demucs_out.rglob("*"):
@@ -80,13 +80,36 @@ def process_job(user_id: str, job_id: str, source_key: str):
                 except: pass
             try: demucs_out.rmdir()
             except: pass
-        run(["python", "-m", "demucs", "--two-stems=vocals", "-o", str(demucs_out), str(pitch)])
 
-        # demucs_out/htdemucs/<basename>/{vocals.wav,no_vocals.wav}
+        run([
+            "python", "-m", "demucs",
+            "-n", "mdx_q",          # faster than htdemucs
+            "--two-stems", "vocals",
+            "--device", "cpu",
+            "--jobs", "1",
+            "--shifts", "0",
+            "--segment", "10",
+            "-o", str(demucs_out),
+            str(pitch),
+        ])
+
+        # Locate Demucs outputs (model dir can vary)
         base = pitch.stem
-        voc_path  = demucs_out / "htdemucs" / base / "vocals.wav"
-        inst_path = demucs_out / "htdemucs" / base / "no_vocals.wav"
-        if not (voc_path.exists() and inst_path.exists()):
+        model_dirs = [d for d in demucs_out.iterdir() if d.is_dir()]
+        voc_path = inst_path = None
+        for d in model_dirs:
+            p_v = d / base / "vocals.wav"
+            p_i = d / base / "no_vocals.wav"
+            if p_v.exists() and p_i.exists():
+                voc_path, inst_path = p_v, p_i
+                break
+        if not (voc_path and inst_path):
+            # fallback: search recursively
+            hits_v = list(demucs_out.rglob("vocals.wav"))
+            hits_i = list(demucs_out.rglob("no_vocals.wav"))
+            if hits_v and hits_i:
+                voc_path, inst_path = hits_v[0], hits_i[0]
+        if not (voc_path and inst_path):
             raise RuntimeError("Demucs output not found")
 
         voc.write_bytes(voc_path.read_bytes())
