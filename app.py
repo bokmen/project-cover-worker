@@ -83,7 +83,7 @@ def process_job(user_id: str, job_id: str, source_key: str):
 
         run([
             "python", "-m", "demucs",
-            "-n", "mdx_q",          # faster than htdemucs
+            "-n", "mdx",          # faster than htdemucs
             "--two-stems", "vocals",
             "--device", "cpu",
             "--jobs", "1",

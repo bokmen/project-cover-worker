@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-# ---- System deps (FFmpeg for audio; libsndfile for demucs/soundfile) ----
+# System deps
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ffmpeg \
@@ -9,20 +9,19 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# ---- Python deps for API + R2 client ----
+# API deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ---- Heavy ML deps (CPU wheels) for Demucs ----
-# Uses PyTorch CPU index; installs demucs + soundfile + diffq (needed by mdx_q)
+# PyTorch CPU + Demucs (no diffq)
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
       torch torchvision torchaudio \
- && pip install --no-cache-dir demucs soundfile diffq
+ && pip install --no-cache-dir demucs soundfile
 
-# ---- App ----
+# App
 COPY app.py .
 
-# Keep CPU usage in check on small instances
+# Keep CPU usage low on small plans
 ENV TORCH_NUM_THREADS=1 \
     OMP_NUM_THREADS=1 \
     MKL_NUM_THREADS=1 \
