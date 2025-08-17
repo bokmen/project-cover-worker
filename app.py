@@ -24,7 +24,7 @@ class Payload(BaseModel):
     jobId: str
     sourceKey: str  # e.g. "source/<uid>/<jobId>.mp3"
 
-# ---------- Helpers ----------
+# ---------- Helper ----------
 def run(cmd: list):
     print("[worker]", " ".join(map(shlex.quote, cmd)))
     subprocess.run(cmd, check=True)
@@ -44,19 +44,22 @@ def process_job(user_id: str, job_id: str, source_key: str):
     pitch_factor = 2 ** (-2 / 12.0)    # ≈ 0.890898718
     sr = 48000
 
-    # One-pass filter graph:
+    # One-pass graph:
     #  - trim to 110s
-    #  - pitch down, keep duration: asetrate=sr/ratio -> resample -> atempo=ratio
-    #  - split to two copies
-    #  - [a] mid (≈ vocals): (L+R)/2, left-only @30%
-    #  - [b] side (≈ instruments): stereo side (L-R, R-L), centered
-    #  - mix [v] + [i]
+    #  - pitch down, keep duration (asetrate  -> resample -> atempo)
+    #  - split to [a] and [b]
+    #  - [a] mid ≈ (L+R)/2, send to LEFT only at 30% (RIGHT muted)
+    #  - [b] side ≈ (L-R, R-L), keep stereo (centered when mixed)
+    #  - amix [v] + [i]
     filter_graph = (
         f"[0:a]atrim=0:110,asetpts=N/SR/TB,"
         f"asetrate={sr}/{pitch_factor},aresample={sr},atempo={pitch_factor},"
         f"asplit=2[a][b];"
+        # vocals branch: 0.30 * ((L+R)/2) -> left; right muted
+        # 0.30 * 0.5 = 0.15  ⇒  c0 = 0.15*c0 + 0.15*c1 ; c1 = 0
         f"[a]aformat=channel_layouts=stereo,"
-        f"pan=stereo|c0=0.30*(0.5*c0+0.5*c1)|c1=0[v];"
+        f"pan=stereo|c0=0.15*c0+0.15*c1|c1=0[v];"
+        # instruments branch: side signal
         f"[b]aformat=channel_layouts=stereo,"
         f"pan=stereo|c0=0.5*c0-0.5*c1|c1=0.5*c1-0.5*c0[i];"
         f"[v][i]amix=inputs=2:normalize=0[mix]"
@@ -89,12 +92,12 @@ def process_job(user_id: str, job_id: str, source_key: str):
     except Exception as e:
         print(f"[worker] ERROR job={job_id}: {e}")
     finally:
-        try:
-            if src.exists(): src.unlink()
-        except: pass
-        try:
-            if out.exists(): out.unlink()
-        except: pass
+        for p in (src, out):
+            try:
+                if p.exists():
+                    p.unlink()
+            except:
+                pass
 
 # ---------- API ----------
 @app.post("/process")
