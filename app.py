@@ -72,7 +72,7 @@ def process_job(user_id: str, job_id: str, source_key: str):
             af = f"asetrate=48000/{pitch_factor},aresample=48000,atempo={pitch_factor}"
             run(["ffmpeg", "-y", "-i", str(t110), "-vn", "-af", af, "-acodec", "libmp3lame", "-b:a", "192k", str(pitch)])
 
-        # 3) Demucs (CPU) -> vocals / no_vocals (faster model + CPU-friendly settings)
+        # 3) Demucs (CPU) -> vocals / no_vocals (lighter model + CPU-friendly settings + timeout + fallback)
         demucs_out = tmp / "demucs_out"
         if demucs_out.exists():
             for p in demucs_out.rglob("*"):
@@ -81,9 +81,9 @@ def process_job(user_id: str, job_id: str, source_key: str):
             try: demucs_out.rmdir()
             except: pass
 
-        run([
+        demucs_cmd = [
             "python", "-m", "demucs",
-            "-n", "mdx",          # faster than htdemucs
+            "-n", "mdx",                # no diffq dependency
             "--two-stems", "vocals",
             "--device", "cpu",
             "--jobs", "1",
@@ -91,43 +91,59 @@ def process_job(user_id: str, job_id: str, source_key: str):
             "--segment", "10",
             "-o", str(demucs_out),
             str(pitch),
-        ])
+        ]
+        print("[worker]", " ".join(map(shlex.quote, demucs_cmd)))
 
-        # Locate Demucs outputs (model dir can vary)
-        base = pitch.stem
-        model_dirs = [d for d in demucs_out.iterdir() if d.is_dir()]
+        demucs_ok = True
+        try:
+            subprocess.run(demucs_cmd, check=True, timeout=480)  # up to 8 minutes
+        except Exception as e:
+            demucs_ok = False
+            print(f"[worker] demucs failed (will fallback): {e}")
+
         voc_path = inst_path = None
-        for d in model_dirs:
-            p_v = d / base / "vocals.wav"
-            p_i = d / base / "no_vocals.wav"
-            if p_v.exists() and p_i.exists():
-                voc_path, inst_path = p_v, p_i
-                break
-        if not (voc_path and inst_path):
-            # fallback: search recursively
-            hits_v = list(demucs_out.rglob("vocals.wav"))
-            hits_i = list(demucs_out.rglob("no_vocals.wav"))
-            if hits_v and hits_i:
-                voc_path, inst_path = hits_v[0], hits_i[0]
-        if not (voc_path and inst_path):
-            raise RuntimeError("Demucs output not found")
+        if demucs_ok:
+            base = pitch.stem
+            # model dir varies by version; search smartly
+            for d in [p for p in demucs_out.iterdir() if p.is_dir()]:
+                pv = d / base / "vocals.wav"
+                pi = d / base / "no_vocals.wav"
+                if pv.exists() and pi.exists():
+                    voc_path, inst_path = pv, pi
+                    break
+            if not (voc_path and inst_path):
+                hits_v = list(demucs_out.rglob("vocals.wav"))
+                hits_i = list(demucs_out.rglob("no_vocals.wav"))
+                if hits_v and hits_i:
+                    voc_path, inst_path = hits_v[0], hits_i[0]
+                else:
+                    demucs_ok = False
+                    print("[worker] demucs outputs not found; will fallback")
 
-        voc.write_bytes(voc_path.read_bytes())
-        inst.write_bytes(inst_path.read_bytes())
+        if demucs_ok:
+            voc.write_bytes(voc_path.read_bytes())
+            inst.write_bytes(inst_path.read_bytes())
 
-        # 4) Mix: vocals left @30% (mute right), instruments centered
-        filt = (
-            "[0:a]aformat=channel_layouts=stereo,volume=0.30,pan=stereo|c0=c0|c1=0[v];"
-            "[1:a]aformat=channel_layouts=stereo,pan=stereo|c0=c0|c1=c1[i];"
-            "[v][i]amix=inputs=2:normalize=0[mix]"
-        )
-        run([
-            "ffmpeg", "-y",
-            "-i", str(voc), "-i", str(inst),
-            "-filter_complex", filt,
-            "-map", "[mix]", "-c:a", "libmp3lame", "-q:a", "4",
-            str(out)
-        ])
+            # 4) Mix: vocals left @30% (mute right), instruments centered
+            # Use named channels (FL/FR) for portability across ffmpeg builds.
+            filt = (
+                "[0:a]aformat=channel_layouts=stereo,volume=0.30,"
+                "pan=stereo|FL=c0|FR=0[v];"
+                "[1:a]aformat=channel_layouts=stereo,"
+                "pan=stereo|FL=c0|FR=c1[i];"
+                "[v][i]amix=inputs=2:normalize=0[mix]"
+            )
+            run([
+                "ffmpeg", "-y",
+                "-i", str(voc), "-i", str(inst),
+                "-filter_complex", filt,
+                "-map", "[mix]", "-c:a", "libmp3lame", "-q:a", "4",
+                str(out)
+            ])
+        else:
+            # Fallback: if demucs can’t run on this machine, ship the pitched audio.
+            print("[worker] fallback: using pitched audio without stem mix")
+            run(["ffmpeg", "-y", "-i", str(pitch), "-c", "copy", str(out)])
 
         # 5) Upload result
         print(f"[worker] uploading s3://{bucket}/{out_key}")
