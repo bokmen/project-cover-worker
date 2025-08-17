@@ -18,18 +18,15 @@ def r2_client():
         config=Config(signature_version="s3v4"),
     )
 
-# ---------- Payload ----------
 class Payload(BaseModel):
     userId: str
     jobId: str
     sourceKey: str  # e.g. "source/<uid>/<jobId>.mp3"
 
-# ---------- Helper ----------
 def run(cmd: list):
     print("[worker]", " ".join(map(shlex.quote, cmd)))
     subprocess.run(cmd, check=True)
 
-# ---------- Worker ----------
 def process_job(user_id: str, job_id: str, source_key: str):
     s3 = r2_client()
     bucket = os.environ["R2_BUCKET"]
@@ -44,24 +41,28 @@ def process_job(user_id: str, job_id: str, source_key: str):
     pitch_factor = 2 ** (-2 / 12.0)    # ≈ 0.890898718
     sr = 48000
 
-    # One-pass graph:
-    #  - trim to 110s
-    #  - pitch down, keep duration (asetrate  -> resample -> atempo)
-    #  - split to [a] and [b]
-    #  - [a] mid ≈ (L+R)/2, send to LEFT only at 30% (RIGHT muted)
-    #  - [b] side ≈ (L-R, R-L), keep stereo (centered when mixed)
-    #  - amix [v] + [i]
+    # Filter graph:
+    #  1) Trim to 110s
+    #  2) Pitch down, keep duration: asetrate -> resample -> atempo
+    #  3) Split to [a] and [b]
+    #  4) [a] make MID (≈ vocals): (FL+FR)/2, send to LEFT only at 30%, mute RIGHT
+    #  5) [b] make SIDE (≈ instruments): (FL-FR, FR-FL), keep stereo
+    #  6) Mix [v] + [i] without normalization
+    #
+    # Notes:
+    #  - Use FL/FR everywhere (no c0/c1) to avoid "mix named and numbered channels".
+    #  - Avoid bare constants; when we need zero, use 0*FR (accepted by strict builds).
     filter_graph = (
-        f"[0:a]atrim=0:110,asetpts=N/SR/TB,"
+        f"[0:a]"
+        f"atrim=0:110,asetpts=N/SR/TB,"
         f"asetrate={sr}/{pitch_factor},aresample={sr},atempo={pitch_factor},"
-        f"asplit=2[a][b];"
-        # vocals branch: 0.30 * ((L+R)/2) -> left; right muted
-        # 0.30 * 0.5 = 0.15  ⇒  c0 = 0.15*c0 + 0.15*c1 ; c1 = 0
-        f"[a]aformat=channel_layouts=stereo,"
-        f"pan=stereo|c0=0.15*c0+0.15*c1|c1=0[v];"
-        # instruments branch: side signal
-        f"[b]aformat=channel_layouts=stereo,"
-        f"pan=stereo|c0=0.5*c0-0.5*c1|c1=0.5*c1-0.5*c0[i];"
+        f"aformat=channel_layouts=stereo,asplit=2[a][b];"
+        # Vocals branch: 0.30 * ((FL+FR)/2) -> LEFT; RIGHT = 0
+        # 0.30 * 0.5 = 0.15, multiply each channel then sum
+        f"[a]pan=stereo|FL=0.15*FL+0.15*FR|FR=0*FR[v];"
+        # Instruments branch: SIDE (L-R, R-L)
+        f"[b]pan=stereo|FL=0.5*FL-0.5*FR|FR=0.5*FR-0.5*FL[i];"
+        # Mix the two stereo streams
         f"[v][i]amix=inputs=2:normalize=0[mix]"
     )
 
@@ -99,7 +100,6 @@ def process_job(user_id: str, job_id: str, source_key: str):
             except:
                 pass
 
-# ---------- API ----------
 @app.post("/process")
 def process(payload: Payload, background: BackgroundTasks):
     background.add_task(process_job, payload.userId, payload.jobId, payload.sourceKey)
